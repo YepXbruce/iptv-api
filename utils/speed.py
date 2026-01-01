@@ -33,7 +33,8 @@ default_ipv6_resolution = "1920x1080"
 default_ipv6_result = {
     'speed': float("inf"),
     'delay': default_ipv6_delay,
-    'resolution': default_ipv6_resolution
+    'resolution': default_ipv6_resolution,
+    'playable': None  # IPv6 with proxy uses default values, not verified
 }
 
 
