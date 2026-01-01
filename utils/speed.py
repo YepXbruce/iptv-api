@@ -216,6 +216,121 @@ def _try_extract_speed_from_ffmpeg_output(output: str) -> float | None:
     return None
 
 
+async def verify_stream_playable(url: str, headers: dict = None, timeout: int = 10) -> dict[str, any]:
+    """
+    Verify if the stream is playable using ffprobe
+    Returns: {'playable': bool, 'has_video': bool, 'has_audio': bool, 'codec': str, 'error': str}
+    """
+    result = {
+        'playable': False,
+        'has_video': False,
+        'has_audio': False,
+        'codec': None,
+        'error': None
+    }
+    proc = None
+    try:
+        probe_args = ['ffprobe', '-v', 'error']
+        if headers:
+            headers_str = ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+            probe_args += ['-headers', headers_str]
+        probe_args += [
+            '-show_entries', 'stream=codec_type,codec_name',
+            '-of', 'json',
+            '-t', str(min(timeout, 5)),  # Only check first few seconds
+            url
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *probe_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        
+        if out:
+            data = json.loads(out.decode('utf-8'))
+            streams = data.get('streams', [])
+            for stream in streams:
+                codec_type = stream.get('codec_type')
+                if codec_type == 'video':
+                    result['has_video'] = True
+                    if not result['codec']:
+                        result['codec'] = stream.get('codec_name')
+                elif codec_type == 'audio':
+                    result['has_audio'] = True
+            
+            # Playable if it has at least video stream
+            result['playable'] = result['has_video']
+        else:
+            result['error'] = err.decode('utf-8', errors='ignore') if err else 'No output from ffprobe'
+            
+    except asyncio.TimeoutError:
+        result['error'] = 'ffprobe timeout'
+        if proc:
+            proc.kill()
+    except json.JSONDecodeError:
+        result['error'] = 'Invalid JSON from ffprobe'
+    except FileNotFoundError:
+        result['error'] = 'ffprobe not found'
+    except Exception as e:
+        result['error'] = str(e)
+    finally:
+        if proc:
+            await proc.wait()
+        return result
+
+
+async def verify_stream_decode(url: str, headers: dict = None, timeout: int = 10, min_frames: int = 30) -> dict[str, any]:
+    """
+    Verify if the stream can be decoded using ffmpeg
+    Returns: {'decodable': bool, 'frame_count': int, 'error': str}
+    """
+    result = {
+        'decodable': False,
+        'frame_count': 0,
+        'error': None
+    }
+    proc = None
+    try:
+        args = ['ffmpeg', '-t', str(timeout)]
+        if headers:
+            headers_str = ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+            args += ['-headers', headers_str]
+        args += ['-http_persistent', '0', '-i', url, '-f', 'null', '-']
+        
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        
+        output = err.decode('utf-8', errors='ignore') if err else ''
+        if out:
+            output += out.decode('utf-8', errors='ignore')
+        
+        # Extract frame count from ffmpeg output
+        frame_count, _ = get_video_info(output)
+        if frame_count > 0:
+            result['frame_count'] = frame_count
+            result['decodable'] = frame_count >= min_frames
+        else:
+            result['error'] = 'No frames decoded'
+            
+    except asyncio.TimeoutError:
+        result['error'] = 'ffmpeg decode timeout'
+        if proc:
+            proc.kill()
+    except FileNotFoundError:
+        result['error'] = 'ffmpeg not found'
+    except Exception as e:
+        result['error'] = str(e)
+    finally:
+        if proc:
+            await proc.wait()
+        return result
+
+
 async def get_result(url: str, headers: dict = None, resolution: str = None,
                      filter_resolution: bool = config.open_filter_resolution,
                      timeout: int = speed_test_timeout) -> dict[str, float | None]:
@@ -428,11 +543,19 @@ async def check_stream_delay(url_info):
 
 
 def get_avg_result(result) -> TestResult:
+    # For playable, use the most common value (True/False), or None if all are None
+    playable_values = [item.get('playable') for item in result if item.get('playable') is not None]
+    avg_playable = None
+    if playable_values:
+        # Use True only if all are True, otherwise False
+        avg_playable = all(playable_values)
+    
     return {
         'speed': sum(item['speed'] or 0 for item in result) / len(result),
         'delay': max(
             int(sum(item['delay'] or -1 for item in result) / len(result)), -1),
-        'resolution': max((item['resolution'] for item in result), key=get_resolution_value)
+        'resolution': max((item['resolution'] for item in result), key=get_resolution_value),
+        'playable': avg_playable
     }
 
 
@@ -443,25 +566,28 @@ def get_speed_result(key: str) -> TestResult:
     if key in cache:
         return get_avg_result(cache[key])
     else:
-        return {'speed': 0, 'delay': -1, 'resolution': 0}
+        return {'speed': 0, 'delay': -1, 'resolution': 0, 'playable': None}
 
 
 async def get_speed(data, headers=None, ipv6_proxy=None, filter_resolution=open_filter_resolution,
-                    timeout=speed_test_timeout, logger=None, callback=None) -> TestResult:
+                    timeout=speed_test_timeout, logger=None, callback=None, verify_playable=True) -> TestResult:
     """
     Get the speed (response time and resolution) of the url
     """
     url = data['url']
     resolution = data['resolution']
-    result: TestResult = {'speed': 0, 'delay': -1, 'resolution': resolution}
+    result: TestResult = {'speed': 0, 'delay': -1, 'resolution': resolution, 'playable': None}
     headers = {**request_headers, **(headers or {})}
     try:
         cache_key = data['host'] if speed_test_filter_host else url
         if cache_key and cache_key in cache:
             result = get_avg_result(cache[cache_key])
+            # Set playable to None for cached results (will be verified if needed)
+            result['playable'] = None
         else:
             if data['ipv_type'] == "ipv6" and ipv6_proxy:
                 result.update(default_ipv6_result)
+                result['playable'] = None  # Skip verification for IPv6 with proxy (using default)
             elif constants.rt_url_pattern.match(url) is not None:
                 start_time = time()
                 if not result['resolution'] and filter_resolution:
@@ -469,16 +595,33 @@ async def get_speed(data, headers=None, ipv6_proxy=None, filter_resolution=open_
                 result['delay'] = int(round((time() - start_time) * 1000))
                 if result['resolution'] is not None:
                     result['speed'] = float("inf")
+                result['playable'] = None  # RTMP streams use different verification
             else:
                 result.update(await get_result(url, headers, resolution, filter_resolution, timeout))
             if cache_key:
                 cache.setdefault(cache_key, []).append(result)
+        
+        # Perform playable verification if enabled and delay is valid
+        if verify_playable and result.get('delay', -1) != -1 and result.get('playable') is None:
+            try:
+                # First check with ffprobe
+                playable_info = await verify_stream_playable(url, headers, timeout)
+                result['playable'] = playable_info['playable']
+                
+                # If ffprobe says it's playable but speed is 0, do decode verification
+                if result['playable'] and round(result.get('speed', 0), 2) == 0:
+                    decode_info = await verify_stream_decode(url, headers, min(timeout, 10), min_frames=10)
+                    # Only mark as playable if at least some frames decoded
+                    result['playable'] = decode_info['decodable']
+            except Exception:
+                # If verification fails, mark as not playable
+                result['playable'] = False
     finally:
         if callback:
             callback()
         if logger:
             logger.info(
-                f"Name: {data.get('name')}, URL: {data.get('url')}, From: {data.get('origin')}, IPv_Type: {data.get("ipv_type")}, Location: {data.get('location')}, ISP: {data.get('isp')}, Date: {data["date"]}, Delay: {result.get('delay') or -1} ms, Speed: {result.get('speed') or 0:.2f} M/s, Resolution: {result.get('resolution')}"
+                f"Name: {data.get('name')}, URL: {data.get('url')}, From: {data.get('origin')}, IPv_Type: {data.get("ipv_type")}, Location: {data.get('location')}, ISP: {data.get('isp')}, Date: {data["date"]}, Delay: {result.get('delay') or -1} ms, Speed: {result.get('speed') or 0:.2f} M/s, Resolution: {result.get('resolution')}, Playable: {result.get('playable')}"
             )
         return result
 
@@ -491,7 +634,8 @@ def get_sort_result(
         filter_resolution=open_filter_resolution,
         min_resolution=min_resolution_value,
         max_resolution=max_resolution_value,
-        ipv6_support=True
+        ipv6_support=True,
+        require_playable=True
 ) -> list[ChannelTestResult]:
     """
     get the sort result
@@ -500,12 +644,19 @@ def get_sort_result(
     for result in results:
         if not ipv6_support and result["ipv_type"] == "ipv6":
             result.update(default_ipv6_result)
-        result_speed, result_delay, resolution = (
+        result_speed, result_delay, resolution, playable = (
             result.get("speed") or 0,
             result.get("delay"),
-            result.get("resolution")
+            result.get("resolution"),
+            result.get("playable")
         )
         if result_delay == -1:
+            continue
+        # Filter out links with speed=0 (even with supply=True)
+        if result_speed == 0:
+            continue
+        # Filter based on playable status if required
+        if require_playable and playable is not None and not playable:
             continue
         if not supply:
             if filter_speed and result_speed < min_speed:
