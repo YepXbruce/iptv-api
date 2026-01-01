@@ -27,11 +27,12 @@ CategoryChannelData = dict[str, dict[str, list[ChannelData]]]
 
 class TestResult(TypedDict):
     """
-    Test result types, including speed, delay, resolution
+    Test result types, including speed, delay, resolution, playable
     """
     speed: int | float | None
     delay: int | float | None
     resolution: int | str | None
+    playable: NotRequired[bool | None]
 
 
 TestResultCacheData = dict[str, list[TestResult]]
