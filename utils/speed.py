@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 from time import time
+from typing import Any
 from urllib.parse import quote, urljoin
 
 import m3u8
@@ -217,7 +218,7 @@ def _try_extract_speed_from_ffmpeg_output(output: str) -> float | None:
     return None
 
 
-async def verify_stream_playable(url: str, headers: dict = None, timeout: int = 10) -> dict[str, any]:
+async def verify_stream_playable(url: str, headers: dict = None, timeout: int = 10) -> dict[str, Any]:
     """
     Verify if the stream is playable using ffprobe
     Returns: {'playable': bool, 'has_video': bool, 'has_audio': bool, 'codec': str, 'error': str}
@@ -234,6 +235,8 @@ async def verify_stream_playable(url: str, headers: dict = None, timeout: int = 
         probe_args = ['ffprobe', '-v', 'error']
         if headers:
             headers_str = ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+            if headers_str and not headers_str.endswith('\r\n'):
+                headers_str += '\r\n'
             probe_args += ['-headers', headers_str]
         probe_args += [
             '-show_entries', 'stream=codec_type,codec_name',
@@ -281,7 +284,7 @@ async def verify_stream_playable(url: str, headers: dict = None, timeout: int = 
         return result
 
 
-async def verify_stream_decode(url: str, headers: dict = None, timeout: int = 10, min_frames: int = 30) -> dict[str, any]:
+async def verify_stream_decode(url: str, headers: dict = None, timeout: int = 10, min_frames: int = 30) -> dict[str, Any]:
     """
     Verify if the stream can be decoded using ffmpeg
     Returns: {'decodable': bool, 'frame_count': int, 'error': str}
@@ -296,6 +299,8 @@ async def verify_stream_decode(url: str, headers: dict = None, timeout: int = 10
         args = ['ffmpeg', '-t', str(timeout)]
         if headers:
             headers_str = ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+            if headers_str and not headers_str.endswith('\r\n'):
+                headers_str += '\r\n'
             args += ['-headers', headers_str]
         args += ['-http_persistent', '0', '-i', url, '-f', 'null', '-']
         
@@ -609,8 +614,8 @@ async def get_speed(data, headers=None, ipv6_proxy=None, filter_resolution=open_
                 playable_info = await verify_stream_playable(url, headers, timeout)
                 result['playable'] = playable_info['playable']
                 
-                # If ffprobe says it's playable but speed is 0, do decode verification
-                if result['playable'] and round(result.get('speed', 0), 2) == 0:
+                # If ffprobe says it's playable but speed is very low (< 0.01), do decode verification
+                if result['playable'] and result.get('speed', 0) < 0.01:
                     decode_info = await verify_stream_decode(url, headers, min(timeout, 10), min_frames=10)
                     # Only mark as playable if at least some frames decoded
                     result['playable'] = decode_info['decodable']
